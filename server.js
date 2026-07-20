@@ -40,7 +40,7 @@ if (isLinux) {
 if (isLinux) {
     console.log(`[${new Date().toISOString()}] Initial check: Chrome at: ${CHROME_PATH}`);
 
-    if (!fs.existsSync(CHROME_PATH)) {
+    if (!CHROME_PATH || !fs.existsSync(CHROME_PATH)) {
         console.log(`[${new Date().toISOString()}] Chrome not found, downloading...`);
         if (!fs.existsSync(CHROME_CACHE_DIR)) {
             fs.mkdirSync(CHROME_CACHE_DIR, { recursive: true });
@@ -53,12 +53,13 @@ if (isLinux) {
                 env: { ...process.env, PUPPETEER_CACHE_DIR: CHROME_CACHE_DIR }
             });
             console.log(`[${new Date().toISOString()}] Chrome installed successfully`);
+            CHROME_PATH = findChrome(CHROME_CACHE_DIR) || '';
         } catch (error) {
             console.error(`[${new Date().toISOString()}] Failed to install Chrome:`, error.message);
         }
     }
 
-    if (fs.existsSync(CHROME_PATH)) {
+    if (CHROME_PATH && fs.existsSync(CHROME_PATH)) {
         console.log(`[${new Date().toISOString()}] ✅ Chrome found at: ${CHROME_PATH}`);
     } else {
         console.log(`[${new Date().toISOString()}] ⚠️ Chrome still not found, will try puppeteer default`);
@@ -167,7 +168,7 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
         await page.setUserAgent(userAgent);
         await page.setViewport({ width: 1366, height: 768 });
 
-        // Speed Optimization: Block heavy assets & mock stripe checkout origin
+        // Speed Optimization: Block heavy non-hcaptcha assets & mock stripe checkout origin
         await page.setRequestInterception(true);
         page.on('request', (req) => {
             const url = req.url();
@@ -179,7 +180,7 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
                     contentType: 'text/html',
                     body: '<!DOCTYPE html><html><head><title>Stripe Challenge</title></head><body><div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div></body></html>'
                 });
-            } else if (['image', 'stylesheet', 'font', 'media'].includes(resourceType)) {
+            } else if (['image', 'stylesheet', 'font', 'media'].includes(resourceType) && !url.includes('hcaptcha.com')) {
                 req.abort();
             } else {
                 req.continue();
@@ -207,27 +208,32 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             document.body.innerHTML = '<div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div>';
             
             return new Promise((resolve, reject) => {
-                const script = document.createElement('script');
-                script.src = 'https://js.hcaptcha.com/1/api.js?recaptchacompat=off';
-                script.async = true;
-                script.defer = true;
-                script.onload = () => {
+                window.onHCaptchaLoaded = () => {
                     try {
-                        window.hcaptcha.render('hcaptcha-container', {
-                            sitekey: key,
-                            rqdata: data,
-                            callback: (token) => {
-                                window.solvedToken = token;
-                            },
-                            'error-callback': (err) => {
-                                window.solvedError = err || 'hcaptcha error';
-                            }
-                        });
-                        resolve();
+                        if (window.hcaptcha && window.hcaptcha.render) {
+                            window.hcaptcha.render('hcaptcha-container', {
+                                sitekey: key,
+                                rqdata: data,
+                                callback: (token) => {
+                                    window.solvedToken = token;
+                                },
+                                'error-callback': (err) => {
+                                    window.solvedError = err || 'hcaptcha error';
+                                }
+                            });
+                            resolve();
+                        } else {
+                            reject('hcaptcha object unavailable after load');
+                        }
                     } catch (e) {
                         reject(e.message);
                     }
                 };
+
+                const script = document.createElement('script');
+                script.src = 'https://js.hcaptcha.com/1/api.js?onload=onHCaptchaLoaded&render=explicit&recaptchacompat=off';
+                script.async = true;
+                script.defer = true;
                 script.onerror = () => reject('Failed to load hCaptcha script');
                 document.head.appendChild(script);
             });
@@ -298,8 +304,6 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             await new Promise(r => setTimeout(r, 1000));
         }
 
-        await browser.close();
-
         if (token) {
             console.log(`[${new Date().toISOString()}] ✅ hCaptcha Solved successfully! Time: ${Date.now() - startTime}ms`);
             return res.json({ success: true, token });
@@ -312,10 +316,15 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
 
     } catch (error) {
         console.error(`[${new Date().toISOString()}] hCaptcha solver error:`, error.message);
+        return res.status(500).json({ success: false, error: error.message });
+    } finally {
         if (browser) {
-            try { await browser.close(); } catch (e) { }
+            try {
+                const pages = await browser.pages();
+                await Promise.all(pages.map(p => p.close().catch(() => {})));
+                await browser.close();
+            } catch (e) {}
         }
-        res.status(500).json({ success: false, error: error.message });
     }
 });
 
