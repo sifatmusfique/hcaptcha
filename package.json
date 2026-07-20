@@ -1,7 +1,7 @@
 {
   "name": "hcaptcha-solver-api",
-  "version": "1.0.0",
-  "description": "Puppeteer hCaptcha & 3DS Automation API",
+  "version": "2.0.0",
+  "description": "Puppeteer hCaptcha solver API using puppeteer-hcaptcha library",
   "main": "server.js",
   "scripts": {
     "start": "node server.js"
@@ -12,6 +12,7 @@
     "express-rate-limit": "^7.1.5",
     "puppeteer": "^22.0.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer-hcaptcha": "^0.2.8"
   }
 }
