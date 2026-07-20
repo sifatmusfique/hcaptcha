@@ -4,7 +4,8 @@
   "description": "Puppeteer hCaptcha solver API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "postinstall": "npx puppeteer browsers install chrome"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -12,6 +13,7 @@
     "express-rate-limit": "^7.1.5",
     "puppeteer": "^22.0.0",
     "puppeteer-extra": "^3.3.6",
-    "puppeteer-extra-plugin-stealth": "^2.11.2"
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "puppeteer-hcaptcha": "^4.1.6"
   }
 }

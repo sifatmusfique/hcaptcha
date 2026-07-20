@@ -290,19 +290,19 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             await page.setViewport({ width: 1366, height: 768 });
             await setProxyAuth(page, proxy);
 
-            // Speed optimization: Block non-hcaptcha heavy assets & mock Stripe checkout origin
+            // Speed optimization: Block non-hcaptcha heavy assets & mock domain origin for instant loading
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 const u = req.url();
                 const resType = req.resourceType();
 
-                if (u.includes('checkout.stripe.com/captcha-test')) {
+                if (resType === 'document') {
                     req.respond({
                         status: 200,
                         contentType: 'text/html',
                         body: '<!DOCTYPE html><html><head><title>Stripe Challenge</title></head><body><div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div></body></html>'
                     });
-                } else if (['image', 'stylesheet', 'font', 'media'].includes(resType) && !u.includes('hcaptcha.com')) {
+                } else if (['image', 'stylesheet', 'font', 'media'].includes(resType) && !u.includes('hcaptcha.com') && !u.includes('stripe.com')) {
                     req.abort();
                 } else {
                     req.continue();
