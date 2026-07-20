@@ -3,10 +3,17 @@ const cors = require('cors');
 const rateLimit = require('express-rate-limit');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-const { hcaptcha, hcaptchaToken } = require('puppeteer-hcaptcha');
 const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
+
+// Safely load puppeteer-hcaptcha library if available
+let hcaptchaLib = null;
+try {
+    hcaptchaLib = require('puppeteer-hcaptcha');
+} catch (e) {
+    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha library not loaded (${e.message}). Using native solver fallback.`);
+}
 
 // ===== USE STEALTH PLUGIN =====
 puppeteer.use(StealthPlugin());
@@ -86,7 +93,8 @@ app.get('/health', (req, res) => {
         timestamp: new Date().toISOString(),
         service: 'hcaptcha-solver-api',
         chrome_exists: CHROME_PATH ? fs.existsSync(CHROME_PATH) : false,
-        chrome_path: CHROME_PATH || 'puppeteer default'
+        chrome_path: CHROME_PATH || 'puppeteer default',
+        hcaptcha_lib_loaded: !!hcaptchaLib
     });
 });
 
@@ -151,7 +159,6 @@ async function setProxyAuth(page, proxy) {
 }
 
 // ===== HCAPTCHA SOLVING ENDPOINT =====
-// Uses puppeteer-hcaptcha library to solve hcaptcha tokens
 app.post('/api/solve-hcaptcha', async (req, res) => {
     const startTime = Date.now();
     let browser = null;
@@ -159,69 +166,170 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
     try {
         const {
             sitekey = 'c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a',
-            url: pageUrl = 'https://accounts.hcaptcha.com/demo',
+            url: pageUrl = 'https://checkout.stripe.com/captcha-test',
             rqdata = null,
             proxy = null,
-            timeout = 120000,
+            timeout = 45000,
             userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         } = req.body;
 
         console.log(`[${new Date().toISOString()}] === HCAPTCHA SOLVER REQUEST ===`);
         console.log(`[${new Date().toISOString()}] SiteKey: ${sitekey}`);
-        console.log(`[${new Date().toISOString()}] Page URL: ${pageUrl}`);
 
-        // hcaptchaToken solves directly without needing a full browser session on the page
-        console.log(`[${new Date().toISOString()}] Solving via puppeteer-hcaptcha (hcaptchaToken)...`);
         let token = null;
 
-        try {
-            token = await hcaptchaToken(`${sitekey}:${pageUrl}`);
-        } catch (libErr) {
-            console.log(`[${new Date().toISOString()}] hcaptchaToken failed, trying browser approach:`, libErr.message);
+        // Try puppeteer-hcaptcha library if available
+        if (hcaptchaLib && hcaptchaLib.hcaptchaToken) {
+            try {
+                console.log(`[${new Date().toISOString()}] Attempting hcaptchaToken from library...`);
+                token = await hcaptchaLib.hcaptchaToken(`${sitekey}:${pageUrl}`);
+            } catch (err) {
+                console.log(`[${new Date().toISOString()}] Library hcaptchaToken failed: ${err.message}`);
+            }
         }
 
-        // Fallback: use browser-based solving with puppeteer-hcaptcha's hcaptcha(page)
         if (!token) {
-            console.log(`[${new Date().toISOString()}] Falling back to browser-based hcaptcha(page)...`);
-
+            console.log(`[${new Date().toISOString()}] Launching browser for hCaptcha checkbox solving...`);
             const launchOptions = buildLaunchOptions(proxy, timeout);
             browser = await puppeteer.launch(launchOptions);
             const page = await browser.newPage();
 
-            try {
-                await page.setUserAgent(userAgent);
-                await page.setViewport({ width: 1366, height: 768 });
-                await setProxyAuth(page, proxy);
+            await page.setBypassCSP(true);
+            await page.setUserAgent(userAgent);
+            await page.setViewport({ width: 1366, height: 768 });
+            await setProxyAuth(page, proxy);
 
-                // Navigate to the target page where hcaptcha is embedded
-                await page.goto(pageUrl, { waitUntil: 'networkidle2', timeout }).catch(() => {});
+            // Network interception to optimize loading speed
+            await page.setRequestInterception(true);
+            page.on('request', (req) => {
+                const u = req.url();
+                const resType = req.resourceType();
 
-                // Let puppeteer-hcaptcha solve the hcaptcha on the page
-                await hcaptcha(page);
-
-                // Extract the token from the response textarea
-                token = await page.evaluate(() => {
-                    const el = document.querySelector('[name="h-captcha-response"], textarea[name="g-recaptcha-response"]');
-                    return el ? el.value : null;
-                });
-
-                if (!token) {
-                    // Try window.solvedToken if it was set
-                    token = await page.evaluate(() => window.hcaptchaToken || null);
+                if (u.includes('checkout.stripe.com/captcha-test')) {
+                    req.respond({
+                        status: 200,
+                        contentType: 'text/html',
+                        body: '<!DOCTYPE html><html><head><title>Stripe Challenge</title></head><body><div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div></body></html>'
+                    });
+                } else if (['image', 'stylesheet', 'font', 'media'].includes(resType) && !u.includes('hcaptcha.com')) {
+                    req.abort();
+                } else {
+                    req.continue();
                 }
-            } finally {
-                const pages = await browser.pages().catch(() => []);
-                await Promise.all(pages.map(p => p.close().catch(() => {})));
-                await browser.close().catch(() => {});
-                browser = null;
+            });
+
+            console.log(`[${new Date().toISOString()}] Loading domain origin...`);
+            await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
+
+            if (hcaptchaLib && hcaptchaLib.hcaptcha) {
+                try {
+                    console.log(`[${new Date().toISOString()}] Solving via puppeteer-hcaptcha library...`);
+                    await hcaptchaLib.hcaptcha(page);
+                } catch (libErr) {
+                    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha page solve warning: ${libErr.message}`);
+                }
+            }
+
+            // Fallback: Inject and render hCaptcha explicitly if not solved yet
+            if (!token) {
+                console.log(`[${new Date().toISOString()}] Injecting hCaptcha container and rendering...`);
+                await page.evaluate((key, data) => {
+                    document.body.innerHTML = '<div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div>';
+
+                    return new Promise((resolve, reject) => {
+                        window.onHCaptchaLoaded = () => {
+                            try {
+                                if (window.hcaptcha && window.hcaptcha.render) {
+                                    window.hcaptcha.render('hcaptcha-container', {
+                                        sitekey: key,
+                                        rqdata: data,
+                                        callback: (t) => { window.solvedToken = t; },
+                                        'error-callback': (err) => { window.solvedError = err || 'hcaptcha error'; }
+                                    });
+                                    resolve();
+                                } else {
+                                    reject('hcaptcha object unavailable');
+                                }
+                            } catch (e) { reject(e.message); }
+                        };
+
+                        const script = document.createElement('script');
+                        script.src = 'https://js.hcaptcha.com/1/api.js?onload=onHCaptchaLoaded&render=explicit&recaptchacompat=off';
+                        script.async = true;
+                        script.defer = true;
+                        script.onerror = () => reject('Failed to load hCaptcha script');
+                        document.head.appendChild(script);
+                    });
+                }, sitekey, rqdata).catch(() => {});
+
+                // Click checkbox in iframe
+                const checkboxClicked = async () => {
+                    const frames = page.frames();
+                    for (const frame of frames) {
+                        const url = frame.url();
+                        if (url.includes('hcaptcha.com') || url.includes('assets.hcaptcha.com')) {
+                            try {
+                                const checkbox = await frame.waitForSelector('#checkbox, #anchor, .check, [aria-checked]', { timeout: 1000 }).catch(() => null);
+                                if (checkbox) {
+                                    await frame.evaluate(() => {
+                                        const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
+                                        if (el) el.click();
+                                    }).catch(() => {});
+                                    await checkbox.click({ delay: 50 }).catch(() => {});
+                                    console.log(`[${new Date().toISOString()}] Clicked hCaptcha checkbox`);
+                                    return true;
+                                }
+                            } catch (e) {}
+                        }
+                    }
+                    return false;
+                };
+
+                for (let i = 0; i < 15; i++) {
+                    if (await checkboxClicked()) break;
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                // Poll for token
+                let isChallengeRequired = false;
+                for (let i = 0; i < 7; i++) {
+                    token = await page.evaluate(() => window.solvedToken || document.querySelector('[name="h-captcha-response"]')?.value);
+                    if (token) break;
+
+                    const challengeVisible = await page.evaluate(() => {
+                        const iframes = Array.from(document.querySelectorAll('iframe'));
+                        for (const f of iframes) {
+                            const title = (f.getAttribute('title') || '').toLowerCase();
+                            const src = (f.getAttribute('src') || '').toLowerCase();
+                            if (src.includes('hcaptcha.com') && title.includes('challenge') && !title.includes('widget') && !title.includes('checkbox')) {
+                                const style = window.getComputedStyle(f);
+                                if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
+                                    return true;
+                                }
+                            }
+                        }
+                        return false;
+                    });
+
+                    if (challengeVisible) {
+                        console.log(`[${new Date().toISOString()}] hCaptcha puzzle challenge detected`);
+                        isChallengeRequired = true;
+                        break;
+                    }
+                    await new Promise(r => setTimeout(r, 1000));
+                }
+
+                if (!token && isChallengeRequired) {
+                    return res.json({ success: false, error: 'challenge_required' });
+                }
             }
         }
 
         if (token) {
-            console.log(`[${new Date().toISOString()}] ✅ hCaptcha Solved! Token length: ${token.length}, Time: ${Date.now() - startTime}ms`);
-            return res.json({ success: true, token, time: Date.now() - startTime });
+            console.log(`[${new Date().toISOString()}] ✅ hCaptcha Solved! Time: ${Date.now() - startTime}ms`);
+            return res.json({ success: true, token });
         } else {
-            return res.json({ success: false, error: 'challenge_required', message: 'Could not solve hCaptcha automatically. Manual challenge required.' });
+            return res.status(500).json({ success: false, error: 'Verification timed out or failed' });
         }
 
     } catch (error) {
@@ -262,65 +370,10 @@ app.post('/api/3ds-automate', async (req, res) => {
             return res.status(400).json({ error: 'URL is required' });
         }
 
-        const launchOptions = {
-            headless: true,
-            args: [
-                '--no-sandbox',
-                '--disable-setuid-sandbox',
-                '--disable-dev-shm-usage',
-                '--disable-gpu',
-                '--disable-web-security',
-                '--disable-features=IsolateOrigins,site-per-process',
-                '--disable-blink-features=AutomationControlled',
-                '--disable-background-timer-throttling',
-                '--disable-backgrounding-occluded-windows',
-                '--disable-renderer-backgrounding',
-                '--disable-ipc-flooding-protection',
-                '--disable-hang-monitor',
-                '--disable-prompt-on-repost',
-                '--disable-sync',
-                '--disable-translate',
-                '--disable-default-apps',
-                '--disable-extensions',
-                '--disable-plugins',
-                '--disable-infobars',
-                '--disable-notifications',
-                '--disable-popup-blocking',
-                '--disable-component-extensions-with-background-pages',
-                '--no-first-run',
-                '--force-color-profile=srgb',
-                '--metrics-recording-only',
-                '--password-store=basic',
-                '--use-mock-keychain',
-                '--single-process',
-                '--disable-accelerated-2d-canvas',
-                '--disable-features=BlockInsecurePrivateNetworkRequests',
-                '--disable-site-isolation-trials',
-                '--disable-web-resource'
-            ],
-            timeout
-        };
-
-        if (proxy) {
-            try {
-                const parts = proxy.trim().split(':');
-                if (parts.length >= 2) {
-                    launchOptions.args.push(`--proxy-server=http://${parts[0]}:${parts[1]}`);
-                }
-            } catch (e) {
-                console.log('Proxy launch arg error:', e.message);
-            }
-        }
-
-        if (CHROME_PATH && fs.existsSync(CHROME_PATH)) {
-            launchOptions.executablePath = CHROME_PATH;
-            console.log(`[${new Date().toISOString()}] Using Chrome at: ${CHROME_PATH}`);
-        }
-
+        const launchOptions = buildLaunchOptions(proxy, timeout);
         browser = await puppeteer.launch(launchOptions);
-        console.log(`[${new Date().toISOString()}] Browser launched`);
-
         const page = await browser.newPage();
+
         await page.setUserAgent(userAgent);
         await page.setViewport(viewport);
         await setProxyAuth(page, proxy);
@@ -353,7 +406,6 @@ app.post('/api/3ds-automate', async (req, res) => {
 
         console.log(`[${new Date().toISOString()}] Page loaded. URL: ${page.url()}`);
 
-        // Auto-submit forms
         if (autoSubmit) {
             for (let attempt = 0; attempt < 3; attempt++) {
                 try {
@@ -371,7 +423,6 @@ app.post('/api/3ds-automate', async (req, res) => {
             }
         }
 
-        // Wait for 3DS + handle captchas
         if (waitFor3DS) {
             console.log(`[${new Date().toISOString()}] Waiting for 3DS completion...`);
             let completed = false;
@@ -383,7 +434,6 @@ app.post('/api/3ds-automate', async (req, res) => {
                 for (const frame of frames) {
                     const frameUrl = frame.url();
 
-                    // Cloudflare Turnstile
                     if (frameUrl.includes('challenges.cloudflare.com')) {
                         try {
                             const cb = await frame.waitForSelector(
@@ -402,32 +452,25 @@ app.post('/api/3ds-automate', async (req, res) => {
                         } catch (e) {}
                     }
 
-                    // hCaptcha - use puppeteer-hcaptcha to solve
-                    if (frameUrl.includes('hcaptcha.com')) {
+                    if (frameUrl.includes('hcaptcha.com') || frameUrl.includes('assets.hcaptcha.com')) {
                         try {
-                            console.log(`[${new Date().toISOString()}] hCaptcha detected, solving with puppeteer-hcaptcha...`);
-                            await hcaptcha(page);
-                            console.log(`[${new Date().toISOString()}] hCaptcha solved via library`);
-                            await new Promise(r => setTimeout(r, 2000));
-                            return true;
-                        } catch (e) {
-                            // Fallback: click checkbox manually
-                            try {
-                                const cb = await frame.waitForSelector(
-                                    '#checkbox, #anchor, .check, [aria-checked]',
-                                    { timeout: 1000 }
-                                ).catch(() => null);
-                                if (cb) {
-                                    await frame.evaluate(() => {
-                                        const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
-                                        if (el) el.click();
-                                    }).catch(() => {});
-                                    await cb.click({ delay: 50 }).catch(() => {});
-                                    await new Promise(r => setTimeout(r, 3000));
-                                    return true;
-                                }
-                            } catch (e2) {}
-                        }
+                            if (hcaptchaLib && hcaptchaLib.hcaptcha) {
+                                await hcaptchaLib.hcaptcha(page).catch(() => {});
+                            }
+                            const cb = await frame.waitForSelector(
+                                '#checkbox, #anchor, .check, [aria-checked]',
+                                { timeout: 1000 }
+                            ).catch(() => null);
+                            if (cb) {
+                                await frame.evaluate(() => {
+                                    const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
+                                    if (el) el.click();
+                                }).catch(() => {});
+                                await cb.click({ delay: 50 }).catch(() => {});
+                                await new Promise(r => setTimeout(r, 3000));
+                                return true;
+                            }
+                        } catch (e) {}
                     }
                 }
                 return false;
@@ -475,7 +518,6 @@ app.post('/api/3ds-automate', async (req, res) => {
             }
         }
 
-        // Collect results
         const finalUrl = page.url();
         const finalTitle = await page.title();
         const finalContent = await page.content();
