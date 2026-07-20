@@ -12,7 +12,7 @@ let hcaptchaLib = null;
 try {
     hcaptchaLib = require('puppeteer-hcaptcha');
 } catch (e) {
-    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha library not loaded (${e.message}). Using native solver fallback.`);
+    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha library not loaded (${e.message}). Using native iframe solver fallback.`);
 }
 
 // ===== USE STEALTH PLUGIN =====
@@ -158,6 +158,96 @@ async function setProxyAuth(page, proxy) {
     }
 }
 
+// ===== Helper: Extract hCaptcha Token Across Main Page & All Frames =====
+async function extractHCaptchaToken(page) {
+    // Check main page context
+    let token = await page.evaluate(() => {
+        return window.solvedToken || 
+               window.hcaptchaToken || 
+               document.querySelector('[name="h-captcha-response"]')?.value || 
+               document.querySelector('[name="g-recaptcha-response"]')?.value ||
+               document.querySelector('textarea[id^="h-captcha-response"]')?.value ||
+               null;
+    }).catch(() => null);
+
+    if (token && token.length > 20) return token;
+
+    // Iterate through all frames (handles nested Stripe checkout iframes)
+    const frames = page.frames();
+    for (const frame of frames) {
+        try {
+            token = await frame.evaluate(() => {
+                return window.solvedToken || 
+                       window.hcaptchaToken || 
+                       document.querySelector('[name="h-captcha-response"]')?.value || 
+                       document.querySelector('[name="g-recaptcha-response"]')?.value ||
+                       document.querySelector('textarea[id^="h-captcha-response"]')?.value ||
+                       null;
+            }).catch(() => null);
+
+            if (token && token.length > 20) return token;
+        } catch (e) {}
+    }
+
+    return null;
+}
+
+// ===== Helper: Click hCaptcha Checkbox inside iframe =====
+async function clickHCaptchaCheckbox(page) {
+    const frames = page.frames();
+    for (const frame of frames) {
+        const frameUrl = frame.url().toLowerCase();
+        const frameName = (frame.name() || '').toLowerCase();
+
+        if (frameUrl.includes('hcaptcha.com') || frameUrl.includes('assets.hcaptcha.com') || frameName.includes('hcaptcha')) {
+            try {
+                const checkbox = await frame.waitForSelector('#checkbox, #anchor, .check, [aria-checked]', { timeout: 1500 }).catch(() => null);
+                if (checkbox) {
+                    await frame.evaluate(() => {
+                        const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
+                        if (el) el.click();
+                    }).catch(() => {});
+                    await checkbox.click({ delay: 50 }).catch(() => {});
+                    console.log(`[${new Date().toISOString()}] Clicked hCaptcha checkbox inside frame: ${frameUrl.substring(0, 60)}`);
+                    return true;
+                }
+            } catch (e) {}
+        }
+    }
+    return false;
+}
+
+// ===== Helper: Solve hCaptcha targeting Frame context directly =====
+async function solveHCaptchaOnFrame(page) {
+    const frames = page.frames();
+
+    for (const frame of frames) {
+        const frameUrl = frame.url().toLowerCase();
+        if (frameUrl.includes('hcaptcha.com') || frameUrl.includes('assets.hcaptcha.com')) {
+            if (hcaptchaLib && hcaptchaLib.hcaptcha) {
+                try {
+                    console.log(`[${new Date().toISOString()}] Running hcaptcha solver on frame context: ${frameUrl.substring(0, 60)}`);
+                    await hcaptchaLib.hcaptcha(frame).catch(async () => {
+                        await hcaptchaLib.hcaptcha(page).catch(() => {});
+                    });
+                } catch (libErr) {}
+            }
+        }
+    }
+
+    // Fallback: click checkbox in iframe
+    await clickHCaptchaCheckbox(page);
+
+    // Poll for token extraction across all frames
+    for (let i = 0; i < 7; i++) {
+        const token = await extractHCaptchaToken(page);
+        if (token) return token;
+        await new Promise(r => setTimeout(r, 1000));
+    }
+
+    return null;
+}
+
 // ===== HCAPTCHA SOLVING ENDPOINT =====
 app.post('/api/solve-hcaptcha', async (req, res) => {
     const startTime = Date.now();
@@ -175,21 +265,22 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
 
         console.log(`[${new Date().toISOString()}] === HCAPTCHA SOLVER REQUEST ===`);
         console.log(`[${new Date().toISOString()}] SiteKey: ${sitekey}`);
+        console.log(`[${new Date().toISOString()}] Page URL: ${pageUrl}`);
 
         let token = null;
 
-        // Try puppeteer-hcaptcha library if available
+        // Try puppeteer-hcaptcha library hcaptchaToken if available
         if (hcaptchaLib && hcaptchaLib.hcaptchaToken) {
             try {
                 console.log(`[${new Date().toISOString()}] Attempting hcaptchaToken from library...`);
                 token = await hcaptchaLib.hcaptchaToken(`${sitekey}:${pageUrl}`);
             } catch (err) {
-                console.log(`[${new Date().toISOString()}] Library hcaptchaToken failed: ${err.message}`);
+                console.log(`[${new Date().toISOString()}] Library hcaptchaToken warning: ${err.message}`);
             }
         }
 
         if (!token) {
-            console.log(`[${new Date().toISOString()}] Launching browser for hCaptcha checkbox solving...`);
+            console.log(`[${new Date().toISOString()}] Launching browser for iframe hCaptcha solving...`);
             const launchOptions = buildLaunchOptions(proxy, timeout);
             browser = await puppeteer.launch(launchOptions);
             const page = await browser.newPage();
@@ -199,7 +290,7 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             await page.setViewport({ width: 1366, height: 768 });
             await setProxyAuth(page, proxy);
 
-            // Network interception to optimize loading speed
+            // Speed optimization: Block non-hcaptcha heavy assets & mock Stripe checkout origin
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 const u = req.url();
@@ -221,115 +312,50 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             console.log(`[${new Date().toISOString()}] Loading domain origin...`);
             await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
 
-            if (hcaptchaLib && hcaptchaLib.hcaptcha) {
-                try {
-                    console.log(`[${new Date().toISOString()}] Solving via puppeteer-hcaptcha library...`);
-                    await hcaptchaLib.hcaptcha(page);
-                } catch (libErr) {
-                    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha page solve warning: ${libErr.message}`);
-                }
-            }
+            // Inject and render hCaptcha explicitly if rendering container
+            await page.evaluate((key, data) => {
+                document.body.innerHTML = '<div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div>';
 
-            // Fallback: Inject and render hCaptcha explicitly if not solved yet
-            if (!token) {
-                console.log(`[${new Date().toISOString()}] Injecting hCaptcha container and rendering...`);
-                await page.evaluate((key, data) => {
-                    document.body.innerHTML = '<div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div>';
-
-                    return new Promise((resolve, reject) => {
-                        window.onHCaptchaLoaded = () => {
-                            try {
-                                if (window.hcaptcha && window.hcaptcha.render) {
-                                    window.hcaptcha.render('hcaptcha-container', {
-                                        sitekey: key,
-                                        rqdata: data,
-                                        callback: (t) => { window.solvedToken = t; },
-                                        'error-callback': (err) => { window.solvedError = err || 'hcaptcha error'; }
-                                    });
-                                    resolve();
-                                } else {
-                                    reject('hcaptcha object unavailable');
-                                }
-                            } catch (e) { reject(e.message); }
-                        };
-
-                        const script = document.createElement('script');
-                        script.src = 'https://js.hcaptcha.com/1/api.js?onload=onHCaptchaLoaded&render=explicit&recaptchacompat=off';
-                        script.async = true;
-                        script.defer = true;
-                        script.onerror = () => reject('Failed to load hCaptcha script');
-                        document.head.appendChild(script);
-                    });
-                }, sitekey, rqdata).catch(() => {});
-
-                // Click checkbox in iframe
-                const checkboxClicked = async () => {
-                    const frames = page.frames();
-                    for (const frame of frames) {
-                        const url = frame.url();
-                        if (url.includes('hcaptcha.com') || url.includes('assets.hcaptcha.com')) {
-                            try {
-                                const checkbox = await frame.waitForSelector('#checkbox, #anchor, .check, [aria-checked]', { timeout: 1000 }).catch(() => null);
-                                if (checkbox) {
-                                    await frame.evaluate(() => {
-                                        const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
-                                        if (el) el.click();
-                                    }).catch(() => {});
-                                    await checkbox.click({ delay: 50 }).catch(() => {});
-                                    console.log(`[${new Date().toISOString()}] Clicked hCaptcha checkbox`);
-                                    return true;
-                                }
-                            } catch (e) {}
-                        }
-                    }
-                    return false;
-                };
-
-                for (let i = 0; i < 15; i++) {
-                    if (await checkboxClicked()) break;
-                    await new Promise(r => setTimeout(r, 1000));
-                }
-
-                // Poll for token
-                let isChallengeRequired = false;
-                for (let i = 0; i < 7; i++) {
-                    token = await page.evaluate(() => window.solvedToken || document.querySelector('[name="h-captcha-response"]')?.value);
-                    if (token) break;
-
-                    const challengeVisible = await page.evaluate(() => {
-                        const iframes = Array.from(document.querySelectorAll('iframe'));
-                        for (const f of iframes) {
-                            const title = (f.getAttribute('title') || '').toLowerCase();
-                            const src = (f.getAttribute('src') || '').toLowerCase();
-                            if (src.includes('hcaptcha.com') && title.includes('challenge') && !title.includes('widget') && !title.includes('checkbox')) {
-                                const style = window.getComputedStyle(f);
-                                if (style.display !== 'none' && style.visibility !== 'hidden' && style.opacity !== '0') {
-                                    return true;
-                                }
+                return new Promise((resolve, reject) => {
+                    window.onHCaptchaLoaded = () => {
+                        try {
+                            if (window.hcaptcha && window.hcaptcha.render) {
+                                window.hcaptcha.render('hcaptcha-container', {
+                                    sitekey: key,
+                                    rqdata: data,
+                                    callback: (t) => { window.solvedToken = t; },
+                                    'error-callback': (err) => { window.solvedError = err || 'hcaptcha error'; }
+                                });
+                                resolve();
+                            } else {
+                                reject('hcaptcha object unavailable');
                             }
-                        }
-                        return false;
-                    });
+                        } catch (e) { reject(e.message); }
+                    };
 
-                    if (challengeVisible) {
-                        console.log(`[${new Date().toISOString()}] hCaptcha puzzle challenge detected`);
-                        isChallengeRequired = true;
-                        break;
-                    }
-                    await new Promise(r => setTimeout(r, 1000));
-                }
+                    const script = document.createElement('script');
+                    script.src = 'https://js.hcaptcha.com/1/api.js?onload=onHCaptchaLoaded&render=explicit&recaptchacompat=off';
+                    script.async = true;
+                    script.defer = true;
+                    script.onerror = () => reject('Failed to load hCaptcha script');
+                    document.head.appendChild(script);
+                });
+            }, sitekey, rqdata).catch(() => {});
 
-                if (!token && isChallengeRequired) {
-                    return res.json({ success: false, error: 'challenge_required' });
-                }
+            // Solve targeting iframe contexts directly
+            token = await solveHCaptchaOnFrame(page);
+
+            // Final check across all frames
+            if (!token) {
+                token = await extractHCaptchaToken(page);
             }
         }
 
         if (token) {
-            console.log(`[${new Date().toISOString()}] ✅ hCaptcha Solved! Time: ${Date.now() - startTime}ms`);
-            return res.json({ success: true, token });
+            console.log(`[${new Date().toISOString()}] ✅ hCaptcha Solved! Token length: ${token.length}, Time: ${Date.now() - startTime}ms`);
+            return res.json({ success: true, token, time: Date.now() - startTime });
         } else {
-            return res.status(500).json({ success: false, error: 'Verification timed out or failed' });
+            return res.status(500).json({ success: false, error: 'challenge_required', message: 'hCaptcha requires manual verification or timed out.' });
         }
 
     } catch (error) {
@@ -424,7 +450,7 @@ app.post('/api/3ds-automate', async (req, res) => {
         }
 
         if (waitFor3DS) {
-            console.log(`[${new Date().toISOString()}] Waiting for 3DS completion...`);
+            console.log(`[${new Date().toISOString()}] Waiting for 3DS completion & checking iframes...`);
             let completed = false;
             let attempts = 0;
             const maxAttempts = 90;
@@ -432,8 +458,9 @@ app.post('/api/3ds-automate', async (req, res) => {
             const trySolveCaptcha = async () => {
                 const frames = page.frames();
                 for (const frame of frames) {
-                    const frameUrl = frame.url();
+                    const frameUrl = frame.url().toLowerCase();
 
+                    // Cloudflare Turnstile
                     if (frameUrl.includes('challenges.cloudflare.com')) {
                         try {
                             const cb = await frame.waitForSelector(
@@ -441,6 +468,7 @@ app.post('/api/3ds-automate', async (req, res) => {
                                 { timeout: 1000 }
                             ).catch(() => null);
                             if (cb) {
+                                console.log(`[${new Date().toISOString()}] Turnstile detected, clicking checkbox...`);
                                 await frame.evaluate(() => {
                                     const el = document.querySelector('#challenge-stage, .ctp-checkbox-label, input[type="checkbox"]');
                                     if (el) el.click();
@@ -452,25 +480,31 @@ app.post('/api/3ds-automate', async (req, res) => {
                         } catch (e) {}
                     }
 
+                    // hCaptcha handling inside Stripe checkout iframe hierarchy
                     if (frameUrl.includes('hcaptcha.com') || frameUrl.includes('assets.hcaptcha.com')) {
-                        try {
-                            if (hcaptchaLib && hcaptchaLib.hcaptcha) {
-                                await hcaptchaLib.hcaptcha(page).catch(() => {});
-                            }
-                            const cb = await frame.waitForSelector(
-                                '#checkbox, #anchor, .check, [aria-checked]',
-                                { timeout: 1000 }
-                            ).catch(() => null);
-                            if (cb) {
-                                await frame.evaluate(() => {
-                                    const el = document.querySelector('#checkbox, #anchor, .check, [aria-checked]');
-                                    if (el) el.click();
-                                }).catch(() => {});
-                                await cb.click({ delay: 50 }).catch(() => {});
-                                await new Promise(r => setTimeout(r, 3000));
-                                return true;
-                            }
-                        } catch (e) {}
+                        console.log(`[${new Date().toISOString()}] hCaptcha detected in iframe: ${frameUrl.substring(0, 60)}`);
+
+                        const solvedToken = await solveHCaptchaOnFrame(page);
+
+                        if (solvedToken) {
+                            console.log(`[${new Date().toISOString()}] ✅ hCaptcha solved inside 3DS flow! Token length: ${solvedToken.length}`);
+
+                            // Inject token into main page & frame form inputs
+                            await page.evaluate((tok) => {
+                                const els = document.querySelectorAll('[name="h-captcha-response"], [name="g-recaptcha-response"]');
+                                els.forEach(el => { el.value = tok; });
+                                window.solvedToken = tok;
+                            }, solvedToken).catch(() => {});
+
+                            await frame.evaluate((tok) => {
+                                const els = document.querySelectorAll('[name="h-captcha-response"], [name="g-recaptcha-response"]');
+                                els.forEach(el => { el.value = tok; });
+                                window.solvedToken = tok;
+                            }, solvedToken).catch(() => {});
+
+                            return true;
+                        }
+                        return true;
                     }
                 }
                 return false;
