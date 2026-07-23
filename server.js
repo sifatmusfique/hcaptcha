@@ -7,12 +7,15 @@ const fs = require('fs');
 const path = require('path');
 const { execSync } = require('child_process');
 
+// Default NoCaptchaAI API key (can be overridden per request or via env)
+const NOCAPTCHA_API_KEY = process.env.NOCAPTCHA_API_KEY || 'nocap_dhpMvbWyYWhbXOhhQIj8PKF7';
+
 // Safely load puppeteer-hcaptcha library if available
 let hcaptchaLib = null;
 try {
     hcaptchaLib = require('puppeteer-hcaptcha');
 } catch (e) {
-    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha library not loaded (${e.message}). Using native iframe solver fallback.`);
+    console.log(`[${new Date().toISOString()}] puppeteer-hcaptcha library not loaded (${e.message}). Using NoCaptchaAI & native iframe solver fallback.`);
 }
 
 // ===== USE STEALTH PLUGIN =====
@@ -92,11 +95,87 @@ app.get('/health', (req, res) => {
         status: 'ok',
         timestamp: new Date().toISOString(),
         service: 'hcaptcha-solver-api',
+        nocaptcha_api_configured: true,
         chrome_exists: CHROME_PATH ? fs.existsSync(CHROME_PATH) : false,
         chrome_path: CHROME_PATH || 'puppeteer default',
         hcaptcha_lib_loaded: !!hcaptchaLib
     });
 });
+
+// ===== Helper: Solve hCaptcha using NoCaptchaAI API =====
+async function solveHCaptchaWithNoCaptchaAI(sitekey, pageUrl, rqdata, apiKey = NOCAPTCHA_API_KEY) {
+    const keyToUse = apiKey || NOCAPTCHA_API_KEY;
+    if (!keyToUse) return null;
+
+    try {
+        console.log(`[${new Date().toISOString()}] Requesting NoCaptchaAI token for sitekey: ${sitekey}`);
+
+        // Strategy 1: Direct NoCaptchaAI /solve endpoint
+        const res = await fetch('https://api.nocaptchaai.com/solve', {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'apikey': keyToUse
+            },
+            body: JSON.stringify({
+                method: 'hcaptcha_token',
+                sitekey: sitekey,
+                site: pageUrl,
+                rqdata: rqdata || undefined
+            })
+        });
+
+        const data = await res.json().catch(() => null);
+        if (data && (data.token || data.generated_pass_UUID || data.solution)) {
+            const token = data.token || data.generated_pass_UUID || data.solution;
+            console.log(`[${new Date().toISOString()}] ✅ NoCaptchaAI solved token! Length: ${token.length}`);
+            return token;
+        }
+
+        // Strategy 2: Task-based NoCaptchaAI /createTask endpoint
+        const taskRes = await fetch('https://api.nocaptchaai.com/createTask', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                clientKey: keyToUse,
+                task: {
+                    type: 'HCaptchaTaskProxyless',
+                    websiteURL: pageUrl,
+                    websiteKey: sitekey,
+                    rqdata: rqdata || undefined
+                }
+            })
+        });
+
+        const taskData = await taskRes.json().catch(() => null);
+        if (taskData && taskData.taskId) {
+            const taskId = taskData.taskId;
+            console.log(`[${new Date().toISOString()}] NoCaptchaAI task created ID: ${taskId}, polling...`);
+
+            for (let i = 0; i < 15; i++) {
+                await new Promise(r => setTimeout(r, 1500));
+                const resultRes = await fetch('https://api.nocaptchaai.com/getTaskResult', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        clientKey: keyToUse,
+                        taskId: taskId
+                    })
+                });
+
+                const resultData = await resultRes.json().catch(() => null);
+                if (resultData && resultData.status === 'ready' && (resultData.solution?.gRecaptchaResponse || resultData.solution?.token)) {
+                    const token = resultData.solution.gRecaptchaResponse || resultData.solution.token;
+                    console.log(`[${new Date().toISOString()}] ✅ NoCaptchaAI task finished token! Length: ${token.length}`);
+                    return token;
+                }
+            }
+        }
+    } catch (err) {
+        console.log(`[${new Date().toISOString()}] NoCaptchaAI solver error: ${err.message}`);
+    }
+    return null;
+}
 
 // ===== Helper: Build launch options =====
 function buildLaunchOptions(proxy, timeout) {
@@ -160,7 +239,6 @@ async function setProxyAuth(page, proxy) {
 
 // ===== Helper: Extract hCaptcha Token Across Main Page & All Frames =====
 async function extractHCaptchaToken(page) {
-    // Check main page context
     let token = await page.evaluate(() => {
         return window.solvedToken || 
                window.hcaptchaToken || 
@@ -172,7 +250,6 @@ async function extractHCaptchaToken(page) {
 
     if (token && token.length > 20) return token;
 
-    // Iterate through all frames (handles nested Stripe checkout iframes)
     const frames = page.frames();
     for (const frame of frames) {
         try {
@@ -235,10 +312,8 @@ async function solveHCaptchaOnFrame(page) {
         }
     }
 
-    // Fallback: click checkbox in iframe
     await clickHCaptchaCheckbox(page);
 
-    // Poll for token extraction across all frames
     for (let i = 0; i < 7; i++) {
         const token = await extractHCaptchaToken(page);
         if (token) return token;
@@ -259,6 +334,7 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             url: pageUrl = 'https://checkout.stripe.com/captcha-test',
             rqdata = null,
             proxy = null,
+            apikey = null,
             timeout = 45000,
             userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36'
         } = req.body;
@@ -267,10 +343,11 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
         console.log(`[${new Date().toISOString()}] SiteKey: ${sitekey}`);
         console.log(`[${new Date().toISOString()}] Page URL: ${pageUrl}`);
 
-        let token = null;
+        // Step 1: Solve via NoCaptchaAI API first (Fastest & No Puppeteer overhead)
+        let token = await solveHCaptchaWithNoCaptchaAI(sitekey, pageUrl, rqdata, apikey);
 
-        // Try puppeteer-hcaptcha library hcaptchaToken if available
-        if (hcaptchaLib && hcaptchaLib.hcaptchaToken) {
+        // Step 2: Fallback to Puppeteer / hCaptcha solver if API did not return token
+        if (!token && hcaptchaLib && hcaptchaLib.hcaptchaToken) {
             try {
                 console.log(`[${new Date().toISOString()}] Attempting hcaptchaToken from library...`);
                 token = await hcaptchaLib.hcaptchaToken(`${sitekey}:${pageUrl}`);
@@ -290,7 +367,6 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             await page.setViewport({ width: 1366, height: 768 });
             await setProxyAuth(page, proxy);
 
-            // Speed optimization: Block non-hcaptcha heavy assets & mock domain origin for instant loading
             await page.setRequestInterception(true);
             page.on('request', (req) => {
                 const u = req.url();
@@ -312,7 +388,6 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
             console.log(`[${new Date().toISOString()}] Loading domain origin...`);
             await page.goto(pageUrl, { waitUntil: 'domcontentloaded', timeout }).catch(() => {});
 
-            // Inject and render hCaptcha explicitly if rendering container
             await page.evaluate((key, data) => {
                 document.body.innerHTML = '<div id="hcaptcha-container" style="display: flex; justify-content: center; align-items: center; height: 100vh;"></div>';
 
@@ -342,10 +417,8 @@ app.post('/api/solve-hcaptcha', async (req, res) => {
                 });
             }, sitekey, rqdata).catch(() => {});
 
-            // Solve targeting iframe contexts directly
             token = await solveHCaptchaOnFrame(page);
 
-            // Final check across all frames
             if (!token) {
                 token = await extractHCaptchaToken(page);
             }
@@ -381,6 +454,7 @@ app.post('/api/3ds-automate', async (req, res) => {
         const {
             url,
             proxy = null,
+            apikey = null,
             timeout = 60000,
             userAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
             waitFor3DS = true,
@@ -484,12 +558,26 @@ app.post('/api/3ds-automate', async (req, res) => {
                     if (frameUrl.includes('hcaptcha.com') || frameUrl.includes('assets.hcaptcha.com')) {
                         console.log(`[${new Date().toISOString()}] hCaptcha detected in iframe: ${frameUrl.substring(0, 60)}`);
 
-                        const solvedToken = await solveHCaptchaOnFrame(page);
+                        // Extract sitekey from iframe URL if available
+                        let sitekey = 'c7faac4c-1cd7-4b1b-b2d4-42ba98d09c7a';
+                        try {
+                            const u = new URL(frameUrl);
+                            if (u.searchParams.has('sitekey')) {
+                                sitekey = u.searchParams.get('sitekey');
+                            }
+                        } catch (e) {}
+
+                        // Try NoCaptchaAI first
+                        let solvedToken = await solveHCaptchaWithNoCaptchaAI(sitekey, page.url(), null, apikey);
+
+                        // Fallback to frame solver
+                        if (!solvedToken) {
+                            solvedToken = await solveHCaptchaOnFrame(page);
+                        }
 
                         if (solvedToken) {
                             console.log(`[${new Date().toISOString()}] ✅ hCaptcha solved inside 3DS flow! Token length: ${solvedToken.length}`);
 
-                            // Inject token into main page & frame form inputs
                             await page.evaluate((tok) => {
                                 const els = document.querySelectorAll('[name="h-captcha-response"], [name="g-recaptcha-response"]');
                                 els.forEach(el => { el.value = tok; });
